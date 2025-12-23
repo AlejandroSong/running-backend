@@ -3,118 +3,189 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 
-// --- CONFIGURACIÓN ---
+// --- CONFIGURACIÓN DEL SERVIDOR ---
 const app = express();
-app.use(cors({ origin: "*" }));
+app.use(cors({ origin: "*" })); // Permite conexión desde cualquier celular
 app.use(express.json());
 
 const server = http.createServer(app);
+
+// Configuración de Socket.io para conexiones inestables (móviles)
 const io = new Server(server, {
     cors: { origin: "*" },
-    pingTimeout: 60000,
+    pingTimeout: 60000, // Espera hasta 60s antes de considerar a alguien desconectado por lag
+    pingInterval: 25000 
 });
 
-// --- MEMORIA (Base de datos volátil) ---
-const activeRuns = new Map(); // Para las carreras
-const squads = {};            // Para los escuadrones { "CODIGO": [miembros...] }
+// --- BASE DE DATOS EN MEMORIA (RAM) ---
+// Estructura: 
+// squads = { 
+//    "A1B2": { members: [{id, name, role}], messages: [] } 
+// }
+const squads = {}; 
+const activeRuns = new Map();
 
-// --- API REST ---
-app.get('/', (req, res) => res.send('Running Zone Command Center: ONLINE 🟢'));
+// --- API REST (Para iniciar carrera individual) ---
+app.get('/', (req, res) => res.send('Running Zone HQ: ONLINE 🟢'));
 
 app.post('/api/iniciar_carrera', (req, res) => {
-    try {
-        const { userId, teamId } = req.body;
-        if (!userId || !teamId) return res.status(400).json({ error: "Datos incompletos" });
-        
-        const runId = Date.now().toString();
-        console.log(`🚀 MISIÓN: ${userId} | ${teamId} | ID: ${runId}`);
-        
-        activeRuns.set(runId, { userId, teamId, startTime: new Date() });
-        res.json({ success: true, run_id: runId });
-    } catch (e) {
-        res.status(500).json({ error: "Error interno" });
-    }
+    const { userId, teamId } = req.body;
+    const runId = Date.now().toString();
+    console.log(`🚀 RUN START: ${userId} | ${teamId}`);
+    activeRuns.set(runId, { userId, startTime: new Date() });
+    res.json({ success: true, run_id: runId });
 });
 
-// --- SOCKETS (LÓGICA DEL JUEGO) ---
+// --- LÓGICA MULTIJUGADOR (SOCKETS) ---
 io.on('connection', (socket) => {
-    console.log(`🔌 Conexión: ${socket.id}`);
+    console.log(`🔌 Nuevo dispositivo: ${socket.id}`);
 
-    // 1. CREAR ESCUADRÓN (Líder)
-    socket.on('create_squad', (userData) => {
-        // Generar código de 4 letras
-        const squadCode = Math.random().toString(36).substring(2, 6).toUpperCase();
+    // --- 1. CREAR ESCUADRÓN ---
+    socket.on('create_squad', (data) => {
+        const userName = data.name || "Agente";
         
-        // Crear sala
-        squads[squadCode] = [];
-        squads[squadCode].push({ id: socket.id, name: userData.name, role: 'LIDER' });
-        
+        // Generar código único de 4 caracteres
+        let squadCode;
+        do {
+            squadCode = Math.random().toString(36).substring(2, 6).toUpperCase();
+        } while (squads[squadCode]); // Asegurar que no exista
+
+        // Crear la sala en memoria
+        squads[squadCode] = {
+            members: [],
+            messages: [] // Historial temporal
+        };
+
+        // Agregar al Líder
+        const newMember = { id: socket.id, name: userName, role: 'LÍDER' };
+        squads[squadCode].members.push(newMember);
+
+        // Unir el socket a la sala "Room" de Socket.io
         socket.join(squadCode);
-        
-        // Responder con la lista de miembros actualizada
-        socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
-        console.log(`✨ Squad Creado: ${squadCode}`);
+
+        // Responder al cliente
+        socket.emit('squad_joined', { 
+            code: squadCode, 
+            members: squads[squadCode].members 
+        });
+
+        console.log(`✨ SQUAD CREADO [${squadCode}] por ${userName}`);
     });
 
-    // 2. UNIRSE A ESCUADRÓN (Soldado)
+    // --- 2. UNIRSE A ESCUADRÓN ---
     socket.on('join_squad', (data) => {
-        const { code, name } = data;
-        if (!code) return;
-        const squadCode = code.toUpperCase();
+        const squadCode = data.code ? data.code.toUpperCase() : "";
+        const userName = data.name || "Agente";
 
+        // Validaciones
         if (!squads[squadCode]) {
-            socket.emit('error_msg', "⚠️ Código inválido.");
+            socket.emit('error_msg', ⚠️ Código inválido o escuadrón disuelto.");
             return;
         }
-        if (squads[squadCode].length >= 5) {
-            socket.emit('error_msg', "⛔ Unidad llena (Máx 5).");
-            return;
+        
+        // Verificar si ya está dentro (re-conexión)
+        const existingMember = squads[squadCode].members.find(m => m.name === userName);
+        if (existingMember) {
+             // Actualizar ID del socket por si se reconectó
+             existingMember.id = socket.id;
+        } else {
+            // Verificar cupo
+            if (squads[squadCode].members.length >= 5) {
+                socket.emit('error_msg', "⛔ Unidad llena (Máx 5 operativos).");
+                return;
+            }
+            // Agregar Soldado
+            squads[squadCode].members.push({ id: socket.id, name: userName, role: 'SOLDADO' });
         }
 
-        // Agregar usuario
-        squads[squadCode].push({ id: socket.id, name: name, role: 'SOLDADO' });
         socket.join(squadCode);
 
-        // Actualizar A TODOS en la sala (para que vean aparecer el avatar)
-        io.to(squadCode).emit('squad_members_update', squads[squadCode]);
+        // AVISAR A TODOS EN LA SALA (Actualizar lista visual)
+        io.to(squadCode).emit('squad_members_update', squads[squadCode].members);
         
-        // Confirmar al usuario
-        socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
-        console.log(`➕ ${name} -> ${squadCode}`);
+        // Confirmar al que entró
+        socket.emit('squad_joined', { 
+            code: squadCode, 
+            members: squads[squadCode].members 
+        });
+
+        // Mensaje de sistema en el chat
+        const sysMsg = { user: "SISTEMA", text: `${userName} se ha unido a la frecuencia.`, type: "system" };
+        io.to(squadCode).emit('chat_broadcast', sysMsg);
+
+        console.log(`➕ JOIN [${squadCode}]: ${userName}`);
     });
 
-    // 3. CHAT TÁCTICO
+    // --- 3. CHAT TÁCTICO ---
     socket.on('chat_message', (data) => {
-        if (data.squadCode) {
-            io.to(data.squadCode).emit('chat_broadcast', data);
+        const { squadCode, user, text } = data;
+        
+        if (squadCode && squads[squadCode]) {
+            // Reenviar a todos en la sala
+            io.to(squadCode).emit('chat_broadcast', data);
+            
+            // Guardar en historial (opcional, por si alguien entra tarde)
+            // squads[squadCode].messages.push(data);
+            
+            console.log(`💬 [${squadCode}] ${user}: ${text}`);
         }
     });
 
-    // 4. GPS / JUEGO
+    // --- 4. GPS EN VIVO (Compartir ubicación con amigos) ---
     socket.on('enviar_coordenadas', (data) => {
-        // Aquí podrías reenviar la posición a los amigos del mismo squadCode
-        // if (socket.squadCode) io.to(socket.squadCode).emit('amigo_movimiento', data);
+        // Esto busca en qué salas está el socket y reenvía la posición a sus amigos
+        const rooms = Array.from(socket.rooms); // Obtiene las salas donde está el usuario
+        
+        rooms.forEach(room => {
+            if (room !== socket.id && squads[room]) { // Ignorar su propia sala privada
+                // Enviar a los demás en el Squad (excepto a uno mismo)
+                socket.to(room).emit('amigo_movimiento', {
+                    id: socket.id,
+                    lat: data.lat,
+                    lng: data.lng,
+                    name: "Aliado" // Podríamos buscar el nombre en la lista members
+                });
+            }
+        });
     });
 
-    // 5. DESCONEXIÓN
+    // --- 5. DESCONEXIÓN (Limpieza) ---
     socket.on('disconnect', () => {
-        // Buscar si estaba en un squad y sacarlo
+        // Buscar en todos los squads si este socket estaba ahí
         for (const code in squads) {
-            const index = squads[code].findIndex(m => m.id === socket.id);
+            const index = squads[code].members.findIndex(m => m.id === socket.id);
+            
             if (index !== -1) {
-                squads[code].splice(index, 1); // Borrar
+                const leaver = squads[code].members[index];
                 
-                if (squads[code].length === 0) {
-                    delete squads[code]; // Borrar sala vacía
+                // Quitarlo de la lista
+                squads[code].members.splice(index, 1);
+                
+                if (squads[code].members.length === 0) {
+                    // Si no queda nadie, destruir el escuadrón para ahorrar memoria
+                    delete squads[code];
+                    console.log(`🗑️ SQUAD ELIMINADO [${code}] (Vacío)`);
                 } else {
-                    io.to(code).emit('squad_members_update', squads[code]); // Actualizar lista
+                    // Avisar a los sobrevivientes
+                    io.to(code).emit('squad_members_update', squads[code].members);
+                    io.to(code).emit('chat_broadcast', { 
+                        user: "SISTEMA", 
+                        text: `${leaver.name} ha perdido la conexión.`, 
+                        type: "system" 
+                    });
                 }
-                break;
+                break; // Ya lo encontramos, dejamos de buscar
             }
         }
         console.log(`❌ Off: ${socket.id}`);
     });
 });
 
+// --- ARRANQUE ---
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🛡️ SERVIDOR ONLINE: ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n==================================================`);
+    console.log(`🛡️  RUNNING ZONE: BACKEND DE COMBATE V2.0`);
+    console.log(`📡  Puerto: ${PORT}`);
+    console.log(`==================================================\n`);
+});
