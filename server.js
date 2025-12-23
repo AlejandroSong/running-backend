@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 
+// --- CONFIGURACIÓN ---
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
@@ -13,87 +14,105 @@ const io = new Server(server, {
     pingTimeout: 60000,
 });
 
-// --- MEMORIA DE ESCUADRONES ---
-// Estructura: { "CODIGO": [ {id: "socketid", name: "Nombre"} ] }
-const squads = {}; 
+// --- MEMORIA (Base de datos volátil) ---
+const activeRuns = new Map(); // Para las carreras
+const squads = {};            // Para los escuadrones { "CODIGO": [miembros...] }
 
-// --- API ---
+// --- API REST ---
+app.get('/', (req, res) => res.send('Running Zone Command Center: ONLINE 🟢'));
+
 app.post('/api/iniciar_carrera', (req, res) => {
-    // (Tu lógica de carrera existente se queda igual)
-    res.json({ success: true, run_id: Date.now() });
+    try {
+        const { userId, teamId } = req.body;
+        if (!userId || !teamId) return res.status(400).json({ error: "Datos incompletos" });
+        
+        const runId = Date.now().toString();
+        console.log(`🚀 MISIÓN: ${userId} | ${teamId} | ID: ${runId}`);
+        
+        activeRuns.set(runId, { userId, teamId, startTime: new Date() });
+        res.json({ success: true, run_id: runId });
+    } catch (e) {
+        res.status(500).json({ error: "Error interno" });
+    }
 });
 
-// --- SOCKETS ---
+// --- SOCKETS (LÓGICA DEL JUEGO) ---
 io.on('connection', (socket) => {
     console.log(`🔌 Conexión: ${socket.id}`);
 
-    // 1. CREAR ESCUADRÓN
+    // 1. CREAR ESCUADRÓN (Líder)
     socket.on('create_squad', (userData) => {
-        // Generar código aleatorio de 4 letras (Ej: A4K9)
+        // Generar código de 4 letras
         const squadCode = Math.random().toString(36).substring(2, 6).toUpperCase();
         
+        // Crear sala
         squads[squadCode] = [];
         squads[squadCode].push({ id: socket.id, name: userData.name, role: 'LIDER' });
         
         socket.join(squadCode);
         
-        // Responder al creador
+        // Responder con la lista de miembros actualizada
         socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
-        console.log(`✨ Squad creado: ${squadCode} por ${userData.name}`);
+        console.log(`✨ Squad Creado: ${squadCode}`);
     });
 
-    // 2. UNIRSE A ESCUADRÓN
+    // 2. UNIRSE A ESCUADRÓN (Soldado)
     socket.on('join_squad', (data) => {
         const { code, name } = data;
+        if (!code) return;
         const squadCode = code.toUpperCase();
 
-        // Validaciones
         if (!squads[squadCode]) {
-            socket.emit('error_msg', "⚠️ El código de escuadrón no existe.");
+            socket.emit('error_msg', "⚠️ Código inválido.");
             return;
         }
         if (squads[squadCode].length >= 5) {
-            socket.emit('error_msg', "⛔ El escuadrón está LLENO (Máx 5).");
+            socket.emit('error_msg', "⛔ Unidad llena (Máx 5).");
             return;
         }
 
-        // Unirse
+        // Agregar usuario
         squads[squadCode].push({ id: socket.id, name: name, role: 'SOLDADO' });
         socket.join(squadCode);
 
-        // Actualizar A TODOS en el grupo (incluyendo al nuevo)
+        // Actualizar A TODOS en la sala (para que vean aparecer el avatar)
         io.to(squadCode).emit('squad_members_update', squads[squadCode]);
         
-        // Confirmar al usuario que entró
+        // Confirmar al usuario
         socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
-        console.log(`➕ ${name} se unió a ${squadCode}`);
+        console.log(`➕ ${name} -> ${squadCode}`);
     });
 
-    // 3. CHAT DE EQUIPO
+    // 3. CHAT TÁCTICO
     socket.on('chat_message', (data) => {
         if (data.squadCode) {
             io.to(data.squadCode).emit('chat_broadcast', data);
         }
     });
 
-    // 4. SALIR / DESCONECTAR
+    // 4. GPS / JUEGO
+    socket.on('enviar_coordenadas', (data) => {
+        // Aquí podrías reenviar la posición a los amigos del mismo squadCode
+        // if (socket.squadCode) io.to(socket.squadCode).emit('amigo_movimiento', data);
+    });
+
+    // 5. DESCONEXIÓN
     socket.on('disconnect', () => {
-        // Buscar en qué squad estaba y sacarlo
+        // Buscar si estaba en un squad y sacarlo
         for (const code in squads) {
-            const index = squads[code].findIndex(member => member.id === socket.id);
+            const index = squads[code].findIndex(m => m.id === socket.id);
             if (index !== -1) {
-                squads[code].splice(index, 1); // Borrar usuario
+                squads[code].splice(index, 1); // Borrar
                 
-                // Si el squad se queda vacío, borrar el squad
                 if (squads[code].length === 0) {
-                    delete squads[code];
+                    delete squads[code]; // Borrar sala vacía
                 } else {
-                    // Avisar a los que quedan
-                    io.to(code).emit('squad_members_update', squads[code]);
+                    io.to(code).emit('squad_members_update', squads[code]); // Actualizar lista
                 }
                 break;
             }
         }
+        console.log(`❌ Off: ${socket.id}`);
     });
 });
 
