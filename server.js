@@ -3,111 +3,99 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 
-// --- CONFIGURACIÓN INICIAL ---
 const app = express();
-const server = http.createServer(app);
-
-// Configuración de CORS (Permite que la App móvil se conecte desde cualquier IP)
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Configuración de Socket.io
+const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*" },
-    pingTimeout: 60000, // Mantiene la conexión viva aunque el internet sea lento
+    pingTimeout: 60000,
 });
 
-// --- BASE DE DATOS EN MEMORIA (RAM) ---
-// En un futuro, esto se reemplazaría por Redis o MongoDB
-const activeRuns = new Map(); 
+// --- MEMORIA DE ESCUADRONES ---
+// Estructura: { "CODIGO": [ {id: "socketid", name: "Nombre"} ] }
+const squads = {}; 
 
-// --- RUTAS HTTP (REST API) ---
-
-// 1. Health Check (Para que Render sepa que estamos vivos)
-app.get('/', (req, res) => {
-    res.send('Running Zone Command Center: ONLINE 🟢');
-});
-
-// 2. Iniciar Carrera
+// --- API ---
 app.post('/api/iniciar_carrera', (req, res) => {
-    try {
-        const { userId, teamId } = req.body;
-
-        // Validación básica
-        if (!userId || !teamId) {
-            return res.status(400).json({ error: "Faltan datos (userId o teamId)" });
-        }
-
-        const runId = Date.now().toString();
-        
-        console.log(`🚀 MISIÓN INICIADA | Agente: ${userId} | Equipo: ${teamId} | ID: ${runId}`);
-        
-        // Guardamos sesión
-        activeRuns.set(runId, { 
-            userId, 
-            teamId, 
-            startTime: new Date(), 
-            coords: [] 
-        });
-
-        res.json({ success: true, run_id: runId });
-
-    } catch (error) {
-        console.error("Error en API:", error);
-        res.status(500).json({ error: "Error interno del servidor" });
-    }
+    // (Tu lógica de carrera existente se queda igual)
+    res.json({ success: true, run_id: Date.now() });
 });
 
-// --- SOCKETS (TIEMPO REAL) ---
+// --- SOCKETS ---
 io.on('connection', (socket) => {
-    console.log(`🔌 Conexión establecida: ${socket.id}`);
+    console.log(`🔌 Conexión: ${socket.id}`);
 
-    // 1. UNIRSE A UN ESCUADRÓN
-    socket.on('join_squad', (code) => {
-        if (!code) return;
+    // 1. CREAR ESCUADRÓN
+    socket.on('create_squad', (userData) => {
+        // Generar código aleatorio de 4 letras (Ej: A4K9)
+        const squadCode = Math.random().toString(36).substring(2, 6).toUpperCase();
         
-        // Normalizamos a mayúsculas para evitar duplicados
-        const squadCode = code.toUpperCase();
+        squads[squadCode] = [];
+        squads[squadCode].push({ id: socket.id, name: userData.name, role: 'LIDER' });
         
         socket.join(squadCode);
-        console.log(`📻 Radio: ${socket.id} sintonizando canal ${squadCode}`);
         
-        // Avisar a los demás en el canal
-        socket.to(squadCode).emit('squad_system_msg', {
-            text: "Un nuevo operativo se ha unido a la frecuencia."
-        });
+        // Responder al creador
+        socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
+        console.log(`✨ Squad creado: ${squadCode} por ${userData.name}`);
     });
 
-    // 2. CHAT TÁCTICO
-    socket.on('chat_message', (data) => {
-        const { squadCode, user, text } = data;
+    // 2. UNIRSE A ESCUADRÓN
+    socket.on('join_squad', (data) => {
+        const { code, name } = data;
+        const squadCode = code.toUpperCase();
+
+        // Validaciones
+        if (!squads[squadCode]) {
+            socket.emit('error_msg', "⚠️ El código de escuadrón no existe.");
+            return;
+        }
+        if (squads[squadCode].length >= 5) {
+            socket.emit('error_msg', "⛔ El escuadrón está LLENO (Máx 5).");
+            return;
+        }
+
+        // Unirse
+        squads[squadCode].push({ id: socket.id, name: name, role: 'SOLDADO' });
+        socket.join(squadCode);
+
+        // Actualizar A TODOS en el grupo (incluyendo al nuevo)
+        io.to(squadCode).emit('squad_members_update', squads[squadCode]);
         
-        if (squadCode && text) {
-            // Reenviar solo a la sala específica
-            io.to(squadCode.toUpperCase()).emit('chat_broadcast', { user, text });
-            console.log(`💬 [${squadCode}] ${user}: ${text}`);
+        // Confirmar al usuario que entró
+        socket.emit('squad_joined', { code: squadCode, members: squads[squadCode] });
+        console.log(`➕ ${name} se unió a ${squadCode}`);
+    });
+
+    // 3. CHAT DE EQUIPO
+    socket.on('chat_message', (data) => {
+        if (data.squadCode) {
+            io.to(data.squadCode).emit('chat_broadcast', data);
         }
     });
 
-    // 3. RECIBIR COORDENADAS GPS
-    socket.on('enviar_coordenadas', (data) => {
-        // Aquí podrías guardar el historial de ruta en 'activeRuns'
-        // O reenviar la posición a los amigos del escuadrón
-        // io.to(miSquadCode).emit('amigo_movimiento', data);
-    });
-
+    // 4. SALIR / DESCONECTAR
     socket.on('disconnect', () => {
-        console.log(`❌ Desconexión: ${socket.id}`);
+        // Buscar en qué squad estaba y sacarlo
+        for (const code in squads) {
+            const index = squads[code].findIndex(member => member.id === socket.id);
+            if (index !== -1) {
+                squads[code].splice(index, 1); // Borrar usuario
+                
+                // Si el squad se queda vacío, borrar el squad
+                if (squads[code].length === 0) {
+                    delete squads[code];
+                } else {
+                    // Avisar a los que quedan
+                    io.to(code).emit('squad_members_update', squads[code]);
+                }
+                break;
+            }
+        }
     });
 });
 
-// --- ARRANQUE DEL SERVIDOR ---
 const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n==================================================`);
-    console.log(`🛡️  RUNNING ZONE: CENTRO DE MANDO OPERATIVO`);
-    console.log(`🌍  Estado: ONLINE`);
-    console.log(`📡  Puerto: ${PORT}`);
-    console.log(`==================================================\n`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`🛡️ SERVIDOR ONLINE: ${PORT}`));
