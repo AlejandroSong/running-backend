@@ -1,52 +1,31 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require("socket.io");
-const cors = require('cors');
+// ... importaciones ...
+const io = new Server(server, { cors: { origin: "*" } });
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const server = http.createServer(app);
-
-// Configuración para permitir conexión desde el celular
-const io = new Server(server, {
-    cors: { origin: "*" }
-});
-
-// Base de datos volátil (RAM)
-const activeRuns = {}; 
-
-// --- API REST ---
-app.post('/api/iniciar_carrera', (req, res) => {
-    const { userId, teamId } = req.body;
-    const runId = Date.now();
-    console.log(`🚀 OPERACIÓN INICIADA | Agente: ${userId} | Equipo: ${teamId}`);
-    activeRuns[runId] = { userId, teamId, startTime: new Date(), coords: [] };
-    res.json({ success: true, run_id: runId });
-});
-
-// --- SOCKETS (TIEMPO REAL) ---
+// --- LÓGICA DE ESCUADRONES (SQUAD) ---
 io.on('connection', (socket) => {
-    console.log(`🔌 Dispositivo conectado: ${socket.id}`);
+    console.log(`🔌 Operativo conectado: ${socket.id}`);
 
-    socket.on('enviar_coordenadas', (data) => {
-        // Aquí recibes latitud, longitud y velocidad del celular
-        // // console.log(`📍 ${data.lat}, ${data.lng} (Vel: ${data.speed})`);
+    // 1. EVENTO PARA UNIRSE
+    socket.on('join_squad', (squadCode) => {
+        socket.join(squadCode); // <--- ESTO CREA LA SALA
+        console.log(`Radio: ${socket.id} se unió al canal ${squadCode}`);
         
-        // Simulación: Si pasa por cierta zona, devuelve una alerta
-        // (Esto es solo para probar que el servidor responde)
+        // Avisar al grupo
+        io.to(squadCode).emit('squad_system_msg', {
+            text: "Un nuevo operativo se ha unido a la frecuencia."
+        });
     });
 
-    socket.on('disconnect', () => {
-        console.log('❌ Dispositivo desconectado');
+    // 2. EVENTO DE CHAT
+    socket.on('chat_message', (data) => {
+        // Solo reenviar a la sala específica
+        if (data.squadCode) {
+            io.to(data.squadCode).emit('chat_broadcast', data);
+        }
     });
+
+    socket.on('disconnect', () => console.log('❌ Off'));
 });
 
-// La nube nos da un puerto en process.env.PORT, si no, usamos 3000
 const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🛡️  SERVIDOR ONLINE`);
-    console.log(`📡 Escuchando en puerto: ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`🛡️ SERVIDOR ONLINE EN PUERTO ${PORT}`));
